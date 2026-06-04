@@ -1,0 +1,15 @@
+{
+  "name": "dotfiles-pi",
+  "private": true,
+  "keywords": ["pi-package"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/*.ts", "!./extensions/auto-model-router.ts"],
+    "skills": ["./skills"],
+    "prompts": ["./prompts/*.md"],
+    "themes": ["./themes/*.json"]
+  }
+}
