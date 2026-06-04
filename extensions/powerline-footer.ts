@@ -1,311 +1,331 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { basename, isAbsolute, join } from "node:path";
 
-const ARROW = "";
-const LEFT_CAP = "";
-const BRANCH_ICON = "";
-const CTX_ICON = "";
-const WINDOW_ICON = "󰥔";
-const WEEK_ICON = "";
+const arrow = "\ue0b4";
+const leftCap = "\ue0b6";
+const branchIcon = "\uf1d3";
+const ctxIcon = "\uf012";
+const windowIcon = "\uf017";
 
-const PALETTE = {
-  dir: { bg: "58;110;161", fg: "229;224;222" },
-  gitClean: { bg: "115;191;159", fg: "46;52;64" },
-  gitDirty: { bg: "211;186;85", fg: "46;52;64" },
-  model: { bg: "200;134;116", fg: "46;52;64" },
-  ctx: { bg: "163;191;220", fg: "30;32;48" },
-  ctxWarn: { bg: "208;135;112", fg: "46;52;64" },
-  ctxCrit: { bg: "191;97;106", fg: "236;239;244" },
-  limit: { bg: "108;91;123", fg: "236;239;244" },
+const palette = {
+	dirBg: "58;110;161",
+	dirFg: "229;224;222",
+	gitCleanBg: "115;191;159",
+	gitCleanFg: "46;52;64",
+	gitDirtyBg: "211;186;85",
+	gitDirtyFg: "46;52;64",
+	modelBg: "200;134;116",
+	modelFg: "46;52;64",
+	ctxBg: "163;191;220",
+	ctxFg: "30;32;48",
+	ctxWarnBg: "208;135;112",
+	ctxWarnFg: "46;52;64",
+	ctxCritBg: "191;97;106",
+	ctxCritFg: "236;239;244",
+	weeklyBg: "136;121;178",
+	weeklyFg: "236;239;244",
 };
 
-type Rgb = { bg: string; fg: string };
-
-function fg(rgb: string, text: string) {
-  return `\x1b[38;2;${rgb}m${text}\x1b[0m`;
+function rgbFg(rgb: string): string {
+	return `\x1b[38;2;${rgb}m`;
 }
 
-function segment(prevBg: string | undefined, colors: Rgb, text: string) {
-  const join = prevBg
-    ? `\x1b[38;2;${prevBg}m\x1b[48;2;${colors.bg}m${ARROW}`
-    : `\x1b[38;2;${colors.bg}m${LEFT_CAP}`;
-
-  return `${join}\x1b[48;2;${colors.bg}m\x1b[38;2;${colors.fg}m ${text} \x1b[0m`;
+function rgbBg(rgb: string): string {
+	return `\x1b[48;2;${rgb}m`;
 }
 
-function renderSegments(parts: Array<{ colors: Rgb; text: string }>) {
-  let out = "";
-  let prevBg: string | undefined;
-
-  for (const part of parts) {
-    out += segment(prevBg, part.colors, part.text);
-    prevBg = part.colors.bg;
-  }
-
-  if (prevBg) out += fg(prevBg, ARROW);
-  return out;
+function reset(): string {
+	return "\x1b[0m";
 }
 
-function git(args: string[], cwd: string) {
-  try {
-    return execFileSync("git", ["-C", cwd, "-c", "gc.autodetach=false", ...args], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
-      timeout: 250,
-    }).trim();
-  } catch {
-    return "";
-  }
+function stripAnsi(s: string): string {
+	return s.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
 }
 
-function getGitSegment(cwd: string) {
-  if (!git(["rev-parse", "--git-dir"], cwd)) return undefined;
-
-  const branch = git(["branch", "--show-current"], cwd) || git(["rev-parse", "--short", "HEAD"], cwd);
-  if (!branch) return undefined;
-
-  const dirty =
-    git(["status", "--porcelain"], cwd)
-      .split("\n")
-      .filter(Boolean).length > 0;
-
-  let ahead = "";
-  let behind = "";
-  const upstream = git(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"], cwd);
-  if (upstream) {
-    const [behindCount, aheadCount] = upstream.split(/\s+/).map((v) => Number(v));
-    if (aheadCount > 0) ahead = ` ↑${aheadCount}`;
-    if (behindCount > 0) behind = ` ↓${behindCount}`;
-  }
-
-  const gitDir = git(["rev-parse", "--git-dir"], cwd);
-  const op = gitDir
-    ? git(["status", "--branch", "--porcelain=v1"], cwd).includes("rebase")
-      ? " REBASE"
-      : ""
-    : "";
-
-  return {
-    colors: dirty || op ? PALETTE.gitDirty : PALETTE.gitClean,
-    text: `${BRANCH_ICON} ${branch}${ahead}${behind}${dirty ? " !" : ""}${op}`,
-  };
+function visibleWidth(s: string): number {
+	return [...stripAnsi(s)].length;
 }
 
-function fmtDuration(ms: number) {
-  const minutes = Math.max(0, Math.floor(ms / 60_000));
-  const days = Math.floor(minutes / 1440);
-  const hours = Math.floor((minutes % 1440) / 60);
-  const mins = minutes % 60;
-  if (days > 0) return `${days}d${hours}h`;
-  if (hours > 0) return `${hours}h${mins}m`;
-  return `${mins}m`;
+function truncateToWidth(s: string, width: number): string {
+	if (visibleWidth(s) <= width) return s;
+	// This footer is usually shorter than the terminal. If it ever overflows,
+	// prefer clipping simply over risking malformed ANSI sequences.
+	let out = "";
+	let visible = 0;
+	for (let i = 0; i < s.length && visible < width; ) {
+		if (s[i] === "\x1b") {
+			const match = /^\x1b\[[0-?]*[ -/]*[@-~]/.exec(s.slice(i));
+			if (match) {
+				out += match[0];
+				i += match[0].length;
+				continue;
+			}
+		}
+		const cp = s.codePointAt(i)!;
+		out += String.fromCodePoint(cp);
+		visible++;
+		i += cp > 0xffff ? 2 : 1;
+	}
+	return out + reset();
 }
 
-function fmtResetFromEpochSeconds(epochSeconds: number) {
-  return fmtDuration(Math.max(0, epochSeconds * 1000 - Date.now()));
+function segment(prevBg: string | undefined, bg: string, fg: string, text: string): { out: string; bg: string } {
+	const joiner = prevBg ? `${rgbFg(prevBg)}${rgbBg(bg)}${arrow}` : `${rgbFg(bg)}${leftCap}`;
+	return {
+		out: `${joiner}${rgbBg(bg)}${rgbFg(fg)} ${text} ${reset()}`,
+		bg,
+	};
 }
 
-type CodexLimitWindow = {
-  usedPercent: number;
-  resetAt: number;
-};
+type GitInfo = { text: string; dirty: boolean };
 
-type CodexLimits = {
-  planType: string;
-  session?: CodexLimitWindow;
-  weekly?: CodexLimitWindow;
-  fetchedAt: number;
-};
-
-function readCodexAuth() {
-  const candidates = [
-    path.join(os.homedir(), ".codex", "auth.json"),
-    path.join(os.homedir(), ".pi", "agent", "auth.json"),
-  ];
-
-  for (const file of candidates) {
-    try {
-      const raw = JSON.parse(readFileSync(file, "utf8"));
-      const tokens = raw.tokens ?? raw["openai-codex"];
-      const accessToken = tokens?.access_token ?? tokens?.access;
-      const accountId = tokens?.account_id ?? tokens?.accountId;
-      if (accessToken) return { accessToken, accountId };
-    } catch {
-      // Try the next auth location.
-    }
-  }
-
-  return undefined;
+function runGit(cwd: string, args: string[]): Promise<string | undefined> {
+	return new Promise((resolve) => {
+		execFile(
+			"git",
+			["-C", cwd, "-c", "gc.autodetach=false", ...args],
+			{ encoding: "utf8", timeout: 750 },
+			(error, stdout) => resolve(error ? undefined : String(stdout).trim()),
+		);
+	});
 }
 
-async function fetchCodexLimits(): Promise<CodexLimits | undefined> {
-  const auth = readCodexAuth();
-  if (!auth) return undefined;
+async function gitOperation(cwd: string): Promise<string> {
+	const gitDirRaw = await runGit(cwd, ["rev-parse", "--absolute-git-dir"]);
+	if (!gitDirRaw) return "";
+	const gitDir = isAbsolute(gitDirRaw) ? gitDirRaw : join(cwd, gitDirRaw);
 
-  const headers: Record<string, string> = {
-    Authorization: `Bearer ${auth.accessToken}`,
-    "Content-Type": "application/json",
-  };
-  if (auth.accountId) headers["chatgpt-account-id"] = auth.accountId;
-
-  const response = await fetch("https://chatgpt.com/backend-api/wham/usage", { headers });
-  if (!response.ok) return undefined;
-
-  const data = await response.json() as any;
-  const primary = data?.rate_limit?.primary_window;
-  const secondary = data?.rate_limit?.secondary_window;
-
-  return {
-    planType: data?.plan_type ?? "unknown",
-    session: primary ? { usedPercent: primary.used_percent ?? 0, resetAt: primary.reset_at ?? 0 } : undefined,
-    weekly: secondary ? { usedPercent: secondary.used_percent ?? 0, resetAt: secondary.reset_at ?? 0 } : undefined,
-    fetchedAt: Date.now(),
-  };
+	try {
+		if (existsSync(join(gitDir, "rebase-merge")) || existsSync(join(gitDir, "rebase-apply"))) return " REBASE";
+		if (existsSync(join(gitDir, "MERGE_HEAD"))) return " MERGE";
+		if (existsSync(join(gitDir, "CHERRY_PICK_HEAD"))) return " CHERRY-PICK";
+		if (existsSync(join(gitDir, "BISECT_LOG"))) return " BISECT";
+		if (existsSync(join(gitDir, "REVERT_HEAD"))) return " REVERT";
+	} catch {
+		// Ignore fs errors.
+	}
+	return "";
 }
 
-function limitColors(remaining: number) {
-  if (remaining <= 10) return PALETTE.ctxCrit;
-  if (remaining <= 25) return PALETTE.ctxWarn;
-  return PALETTE.limit;
+async function gitText(cwd: string, branchFromFooter: string | null): Promise<GitInfo | undefined> {
+	const inside = await runGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
+	if (inside !== "true") return undefined;
+
+	const [branchRaw, porcelain, upstream, operation] = await Promise.all([
+		branchFromFooter ? Promise.resolve(branchFromFooter) : runGit(cwd, ["branch", "--show-current"]),
+		runGit(cwd, ["status", "--porcelain", "--untracked-files=no"]),
+		runGit(cwd, ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"]),
+		gitOperation(cwd),
+	]);
+
+	const branch = branchRaw || "detached";
+	const dirty = !!porcelain;
+	let ahead = "";
+	let behind = "";
+	if (upstream) {
+		const [behindCount, aheadCount] = upstream.split(/\s+/).map((n) => Number.parseInt(n, 10));
+		if (aheadCount > 0) ahead = ` ↑${aheadCount}`;
+		if (behindCount > 0) behind = ` ↓${behindCount}`;
+	}
+
+	return { text: `${branchIcon} ${branch}${ahead}${behind}${dirty ? " !" : ""}${operation}`, dirty: dirty || !!operation };
+}
+
+function modelLabel(model: unknown): string {
+	const m = model as { name?: string; id?: string; provider?: string } | undefined;
+	return m?.name || m?.id || "no model";
+}
+
+type LimitInfo = { remainingPct: number; text: string };
+
+function headerNumber(headers: Record<string, string>, names: string[]): number | undefined {
+	for (const name of names) {
+		const value = headers[name.toLowerCase()];
+		if (!value) continue;
+		const num = Number.parseFloat(value.replace(/,/g, ""));
+		if (Number.isFinite(num)) return num;
+	}
+	return undefined;
+}
+
+function headerValue(headers: Record<string, string>, names: string[]): string | undefined {
+	for (const name of names) {
+		const value = headers[name.toLowerCase()];
+		if (value) return value;
+	}
+	return undefined;
+}
+
+function normalizeHeaders(headers: Record<string, string>): Record<string, string> {
+	return Object.fromEntries(Object.entries(headers).map(([key, value]) => [key.toLowerCase(), value]));
+}
+
+function formatReset(value: string | undefined): string {
+	if (!value) return "";
+	const trimmed = value.trim();
+	if (!trimmed) return "";
+	const epoch = Number.parseInt(trimmed, 10);
+	if (Number.isFinite(epoch) && epoch > 1_000_000_000) {
+		const seconds = Math.max(0, epoch - Math.floor(Date.now() / 1000));
+		const days = Math.floor(seconds / 86400);
+		const hours = Math.floor((seconds % 86400) / 3600);
+		if (days > 0) return ` ${days}d${hours}h`;
+		if (hours > 0) return ` ${hours}h`;
+		return ` ${Math.floor(seconds / 60)}m`;
+	}
+	return ` ${trimmed}`;
+}
+
+function limitFromHeaders(rawHeaders: Record<string, string>): { fiveHour?: LimitInfo; weekly?: LimitInfo } | undefined {
+	const headers = normalizeHeaders(rawHeaders);
+	const codexHeaderEntries = Object.entries(headers)
+		.filter(([key]) => key.includes("codex") || key.includes("ratelimit"))
+		.sort(([a], [b]) => a.localeCompare(b));
+	if (codexHeaderEntries.length === 0) return undefined;
+
+	const out: { fiveHour?: LimitInfo; weekly?: LimitInfo } = {};
+
+	const primaryUsed = headerNumber(headers, ["x-codex-primary-used-percent"]);
+	if (primaryUsed !== undefined) {
+		const primaryReset = headerValue(headers, ["x-codex-primary-reset-at"]);
+		const remainingPct = Math.max(0, Math.min(100, 100 - primaryUsed));
+		out.fiveHour = { remainingPct, text: `${windowIcon} ${Math.round(remainingPct)}%${formatReset(primaryReset)}` };
+	}
+
+	const secondaryUsed = headerNumber(headers, ["x-codex-secondary-used-percent"]);
+	if (secondaryUsed !== undefined) {
+		const secondaryReset = headerValue(headers, ["x-codex-secondary-reset-at"]);
+		const remainingPct = Math.max(0, Math.min(100, 100 - secondaryUsed));
+		out.weekly = { remainingPct, text: `${windowIcon} ${Math.round(remainingPct)}%${formatReset(secondaryReset)}` };
+	}
+
+	if (!out.fiveHour && !out.weekly) {
+		const limit = headerNumber(headers, ["x-ratelimit-limit-requests", "x-ratelimit-limit-tokens"]);
+		const remaining = headerNumber(headers, ["x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens"]);
+		const reset = headerValue(headers, ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"]);
+		if (limit && remaining !== undefined) {
+			const remainingPct = Math.max(0, Math.min(100, (remaining / limit) * 100));
+			out.fiveHour = { remainingPct, text: `${windowIcon} ${Math.round(remainingPct)}%${formatReset(reset)}` };
+		}
+	}
+
+	return out;
 }
 
 export default function (pi: ExtensionAPI) {
-  let enabled = true;
-  let codexLimits: CodexLimits | undefined;
-  let codexLimitsRefreshInFlight: Promise<void> | undefined;
+	let requestGitRefresh: (() => void) | undefined;
+	let requestFooterRender: (() => void) | undefined;
+	let fiveHourLimit: LimitInfo | undefined;
+	let weeklyLimit: LimitInfo | undefined;
 
-  async function refreshCodexLimits() {
-    if (codexLimitsRefreshInFlight) return codexLimitsRefreshInFlight;
-    codexLimitsRefreshInFlight = fetchCodexLimits()
-      .then((limits) => {
-        if (limits) codexLimits = limits;
-      })
-      .catch(() => {})
-      .finally(() => {
-        codexLimitsRefreshInFlight = undefined;
-      });
-    return codexLimitsRefreshInFlight;
-  }
+	pi.on("session_start", (_event, ctx) => {
+		ctx.ui.setFooter((tui, _theme, footerData) => {
+			requestFooterRender = () => tui.requestRender();
+			let gitCache: GitInfo | undefined;
+			let refreshInFlight = false;
+			let disposed = false;
 
-  function installFooter(ctx: any) {
-    ctx.ui.setFooter((tui: any, theme: any, footerData: any) => {
-      const unsub = footerData.onBranchChange(() => tui.requestRender());
+			const refreshGit = async () => {
+				if (refreshInFlight || disposed) return;
+				refreshInFlight = true;
+				try {
+					gitCache = await gitText(ctx.cwd, footerData.getGitBranch());
+				} finally {
+					refreshInFlight = false;
+					if (!disposed) tui.requestRender();
+				}
+			};
 
-      return {
-        dispose: unsub,
-        invalidate() {},
-        render(width: number): string[] {
-          const cwd = process.cwd();
-          const dirName = path.basename(cwd);
+			const triggerRefresh = () => void refreshGit();
+			requestGitRefresh = triggerRefresh;
+			void refreshGit();
+			const unsubscribe = footerData.onBranchChange(triggerRefresh);
 
-          let lastTotal = 0;
+			return {
+				dispose() {
+					disposed = true;
+					if (requestGitRefresh === triggerRefresh) requestGitRefresh = undefined;
+					requestFooterRender = undefined;
+					unsubscribe();
+				},
+				invalidate() {},
+				render(width: number): string[] {
+					const parts: string[] = [];
+					let prev: string | undefined;
+					const add = (bg: string, fg: string, text: string) => {
+						const s = segment(prev, bg, fg, text);
+						parts.push(s.out);
+						prev = s.bg;
+					};
 
-          for (const entry of ctx.sessionManager.getBranch()) {
-            if (entry.type === "message" && entry.message.role === "assistant") {
-              const message = entry.message;
-              if (!message.usage) continue;
+					add(palette.dirBg, palette.dirFg, basename(ctx.cwd) || ctx.cwd);
 
-              lastTotal = message.usage.totalTokens ||
-                (message.usage.input ?? 0) +
-                  (message.usage.output ?? 0) +
-                  (message.usage.cacheRead ?? 0) +
-                  (message.usage.cacheWrite ?? 0);
-            }
-          }
+					if (gitCache) {
+						add(
+							gitCache.dirty ? palette.gitDirtyBg : palette.gitCleanBg,
+							gitCache.dirty ? palette.gitDirtyFg : palette.gitCleanFg,
+							gitCache.text,
+						);
+					}
 
-          const model = ctx.model?.name || ctx.model?.id || "model";
-          const effort = pi.getThinkingLevel();
-          const modelText = effort && effort !== "off" ? `${model} ${effort}` : model;
-          const contextWindow = ctx.model?.contextWindow || ctx.model?.input || 0;
-          const remaining = contextWindow > 0 ? Math.max(0, 100 - Math.round((lastTotal / contextWindow) * 100)) : undefined;
-          const ctxColors = remaining === undefined
-            ? PALETTE.ctx
-            : remaining <= 25
-              ? PALETTE.ctxCrit
-              : remaining <= 55
-                ? PALETTE.ctxWarn
-                : PALETTE.ctx;
+					add(palette.modelBg, palette.modelFg, ` ${modelLabel(ctx.model)}`);
 
-          const parts: Array<{ colors: Rgb; text: string }> = [
-            { colors: PALETTE.dir, text: dirName },
-          ];
+					const usage = ctx.getContextUsage();
+					if (usage?.percent !== null && usage?.percent !== undefined) {
+						const remaining = Math.max(0, Math.round(100 - usage.percent));
+						if (remaining <= 25) add(palette.ctxCritBg, palette.ctxCritFg, `${ctxIcon} ${remaining}%`);
+						else if (remaining <= 55) add(palette.ctxWarnBg, palette.ctxWarnFg, `${ctxIcon} ${remaining}%`);
+						else add(palette.ctxBg, palette.ctxFg, `${ctxIcon} ${remaining}%`);
+					}
 
-          const gitSegment = getGitSegment(cwd);
-          if (gitSegment) parts.push(gitSegment);
+					if (fiveHourLimit) {
+						if (fiveHourLimit.remainingPct <= 10) add(palette.ctxCritBg, palette.ctxCritFg, fiveHourLimit.text);
+						else if (fiveHourLimit.remainingPct <= 25) add(palette.ctxWarnBg, palette.ctxWarnFg, fiveHourLimit.text);
+						else add(palette.weeklyBg, palette.weeklyFg, fiveHourLimit.text);
+					}
+					if (weeklyLimit) {
+						if (weeklyLimit.remainingPct <= 10) add(palette.ctxCritBg, palette.ctxCritFg, weeklyLimit.text);
+						else if (weeklyLimit.remainingPct <= 25) add(palette.ctxWarnBg, palette.ctxWarnFg, weeklyLimit.text);
+						else add(palette.weeklyBg, palette.weeklyFg, weeklyLimit.text);
+					}
 
-          parts.push({ colors: PALETTE.model, text: modelText });
+					let line = parts.join("");
+					if (prev) line += `${rgbFg(prev)}${arrow}${reset()}`;
+					const w = visibleWidth(line);
+					if (w < width) line += " ".repeat(width - w);
+					return [truncateToWidth(line, width)];
+				},
+			};
+		});
+	});
 
-          if (remaining !== undefined) {
-            parts.push({ colors: ctxColors, text: `${CTX_ICON} ${remaining}%` });
-          }
+	pi.on("after_provider_response", (event) => {
+		const next = limitFromHeaders(event.headers);
+		if (next) {
+			if (next.fiveHour) fiveHourLimit = next.fiveHour;
+			if (next.weekly) weeklyLimit = next.weekly;
+			requestFooterRender?.();
+		}
+	});
 
-          if (ctx.model?.provider === "openai-codex" && codexLimits?.session) {
-            const remaining = Math.max(0, Math.round(100 - codexLimits.session.usedPercent));
-            parts.push({
-              colors: limitColors(remaining),
-              text: `${WINDOW_ICON} ${remaining}% ${fmtResetFromEpochSeconds(codexLimits.session.resetAt)}`,
-            });
-          }
+	pi.on("turn_end", () => {
+		requestGitRefresh?.();
+	});
 
-          if (ctx.model?.provider === "openai-codex" && codexLimits?.weekly) {
-            const remaining = Math.max(0, Math.round(100 - codexLimits.weekly.usedPercent));
-            parts.push({
-              colors: limitColors(remaining),
-              text: `${WEEK_ICON} ${remaining}% ${fmtResetFromEpochSeconds(codexLimits.weekly.resetAt)}`,
-            });
-          }
+	pi.on("tool_execution_end", () => {
+		requestGitRefresh?.();
+	});
 
-          const line = renderSegments(parts);
-          if (visibleWidth(line) <= width) return [line];
-          return [truncateToWidth(line, width)];
-        },
-      };
-    });
-  }
+	pi.on("user_bash", () => {
+		requestGitRefresh?.();
+	});
 
-  pi.on("session_start", async (_event, ctx) => {
-    await refreshCodexLimits();
-    if (enabled) installFooter(ctx);
-  });
-
-  pi.on("turn_end", async () => {
-    await refreshCodexLimits();
-  });
-
-  pi.registerCommand("powerline-footer", {
-    description: "Toggle the capsule-style powerline footer",
-    handler: async (_args, ctx) => {
-      enabled = !enabled;
-      if (enabled) {
-        installFooter(ctx);
-        ctx.ui.notify("Powerline footer enabled", "info");
-      } else {
-        ctx.ui.setFooter(undefined);
-        ctx.ui.notify("Powerline footer disabled", "info");
-      }
-    },
-  });
-
-  pi.registerCommand("codex-limits", {
-    description: "Refresh Codex account limits shown in the footer",
-    handler: async (_args, ctx) => {
-      await refreshCodexLimits();
-      if (!codexLimits) {
-        ctx.ui.notify("Could not fetch Codex limits", "warning");
-        return;
-      }
-
-      const session = codexLimits.session
-        ? `${Math.max(0, Math.round(100 - codexLimits.session.usedPercent))}% remaining, resets in ${fmtResetFromEpochSeconds(codexLimits.session.resetAt)}`
-        : "unavailable";
-      const weekly = codexLimits.weekly
-        ? `${Math.max(0, Math.round(100 - codexLimits.weekly.usedPercent))}% remaining, resets in ${fmtResetFromEpochSeconds(codexLimits.weekly.resetAt)}`
-        : "unavailable";
-      ctx.ui.notify(`Codex limits (${codexLimits.planType}): session ${session}; weekly ${weekly}`, "info");
-    },
-  });
+	pi.on("session_shutdown", () => {
+		requestGitRefresh = undefined;
+		requestFooterRender = undefined;
+		fiveHourLimit = undefined;
+		weeklyLimit = undefined;
+	});
 }
