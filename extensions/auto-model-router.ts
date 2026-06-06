@@ -194,8 +194,8 @@ export default function (pi: ExtensionAPI) {
 			if (arg === "on") {
 				enabled = true;
 				ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("accent", "auto:on"));
-				// Make the middle tier the default immediately.
-				await applyRoute(pi, ctx, { tier: "normal", ...ROUTES.normal, reason: "enabled: default middle tier" }, false);
+				// Start cheap; before_agent_start will escalate if the prompt warrants it.
+				await applyRoute(pi, ctx, { tier: "cheap", ...ROUTES.cheap, reason: "enabled: default cheap tier" }, false);
 				ctx.ui.notify("Auto-model enabled", "info");
 				return;
 			}
@@ -217,8 +217,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (_event, ctx) => {
 		if (!enabled) return;
 		ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("accent", "auto:on"));
-		// Make the middle tier the default model for the session (saves usage vs 5.5-codex).
-		await applyRoute(pi, ctx, { tier: "normal", ...ROUTES.normal, reason: "session default middle tier" }, false);
+		// Start cheap; before_agent_start will escalate if the prompt warrants it.
+		await applyRoute(pi, ctx, { tier: "cheap", ...ROUTES.cheap, reason: "session default cheap tier" }, false);
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
