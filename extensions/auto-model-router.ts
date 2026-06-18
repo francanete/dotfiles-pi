@@ -1,4 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import { Box, Container, SelectList, Text, type SelectItem } from "@earendil-works/pi-tui";
 
 type Tier = "cheap" | "normal" | "hard";
 
@@ -180,21 +182,111 @@ async function applyRoute(pi: ExtensionAPI, ctx: ExtensionContext, route: Route,
 }
 
 export default function (pi: ExtensionAPI) {
+	function buildStatusLines(): string[] {
+		return [
+			`State: ${enabled ? "on" : "off"}`,
+			`Default: ${ROUTES.cheap.model}`,
+			`Low: ${ROUTES.cheap.model} (${ROUTES.cheap.thinking})`,
+			`Medium: ${ROUTES.normal.model} (${ROUTES.normal.thinking})`,
+			`High: ${ROUTES.hard.model} (${ROUTES.hard.thinking})`,
+		];
+	}
+
+	async function showAutoModelOverlay(ctx: ExtensionContext): Promise<void> {
+		const items: SelectItem[] = [
+			{ value: "status", label: "Show status", description: "Display current on/off state and model mapping" },
+			{ value: "on", label: "Turn on", description: "Enable auto-model routing" },
+			{ value: "off", label: "Turn off", description: "Disable auto-model routing" },
+			{ value: "cheap", label: "Force cheap next turn", description: `Next prompt uses ${ROUTES.cheap.model}` },
+			{ value: "normal", label: "Force medium next turn", description: `Next prompt uses ${ROUTES.normal.model}` },
+			{ value: "hard", label: "Force high next turn", description: `Next prompt uses ${ROUTES.hard.model}` },
+		];
+
+		const result = await ctx.ui.custom<string | null>(
+			(tui, theme, _kb, done) => {
+				const root = new Container();
+				root.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+				const framed = new Box(1, 0, (s: string) => theme.bg("toolPendingBg", theme.fg("borderMuted", s)));
+				const content = new Container();
+				content.addChild(new Text(theme.fg("accent", theme.bold("Auto-model Router")), 1, 0));
+				for (const line of buildStatusLines()) {
+					content.addChild(new Text(theme.fg("muted", line), 1, 0));
+				}
+
+				const menu = new SelectList(items, items.length, {
+					selectedPrefix: (s) => theme.fg("accent", s),
+					selectedText: (s) => theme.fg("accent", s),
+					description: (s) => theme.fg("muted", s),
+					scrollInfo: (s) => theme.fg("dim", s),
+					noMatch: (s) => theme.fg("warning", s),
+				});
+
+				menu.onSelect = (item) => done(item.value);
+				menu.onCancel = () => done(null);
+
+				content.addChild(menu);
+				content.addChild(new Text(theme.fg("dim", "↑↓ navigate • enter select • esc cancel"), 1, 0));
+				framed.addChild(content);
+				root.addChild(framed);
+				root.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+
+				return {
+					render: (width: number) => root.render(width),
+					invalidate: () => root.invalidate(),
+					handleInput: (data: string) => {
+						menu.handleInput(data);
+						tui.requestRender();
+					},
+				};
+			},
+			{ overlay: true, overlayOptions: { width: "60%", minWidth: 42, maxHeight: "75%", anchor: "center" } },
+		);
+
+		if (!result || result === "status") {
+			ctx.ui.notify(
+				`Auto-model: ${enabled ? "on" : "off"}. Routes: low=${ROUTES.cheap.model}, medium=${ROUTES.normal.model}, high=${ROUTES.hard.model}`,
+				"info",
+			);
+			return;
+		}
+
+		if (result === "on") {
+			enabled = true;
+			ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("accent", "auto:on"));
+			await applyRoute(pi, ctx, { tier: "cheap", ...ROUTES.cheap, reason: "enabled: default cheap tier" }, false);
+			ctx.ui.notify("Auto-model enabled", "info");
+			return;
+		}
+
+		if (result === "off" || result === "disable" || result === "disabled") {
+			enabled = false;
+			ctx.ui.setStatus("auto-model", undefined);
+			ctx.ui.notify("Auto-model disabled", "info");
+			return;
+		}
+
+		if (result === "cheap" || result === "normal" || result === "hard") {
+			nextOverride = result;
+			ctx.ui.notify(`Auto-model: next prompt forced to ${result}`, "info");
+		}
+	}
+
 	pi.registerCommand("automodel", {
 		description: "Auto-route prompts to cheap/normal/hard OpenAI Codex models",
 		handler: async (args, ctx) => {
 			const arg = args.trim().toLowerCase();
-			if (!arg || arg === "status") {
-				ctx.ui.notify(
-					`Auto-model: ${enabled ? "on" : "off"}. Routes: cheap=${ROUTES.cheap.model}, normal=${ROUTES.normal.model}, hard=${ROUTES.hard.model}`,
-					"info",
-				);
+			if (!arg) {
+				await showAutoModelOverlay(ctx);
+				return;
+			}
+			if (arg === "status") {
+				await showAutoModelOverlay(ctx);
 				return;
 			}
 			if (arg === "on") {
 				enabled = true;
 				ctx.ui.setStatus("auto-model", ctx.ui.theme.fg("accent", "auto:on"));
-				// Start cheap; before_agent_start will escalate if the prompt warrants it.
 				await applyRoute(pi, ctx, { tier: "cheap", ...ROUTES.cheap, reason: "enabled: default cheap tier" }, false);
 				ctx.ui.notify("Auto-model enabled", "info");
 				return;
@@ -210,7 +302,7 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`Auto-model: next prompt forced to ${arg}`, "info");
 				return;
 			}
-			ctx.ui.notify("Usage: /automodel on|off|disable|status|cheap|normal|hard", "warning");
+			ctx.ui.notify("Usage: /automodel [on|off|status|cheap|normal|hard]", "warning");
 		},
 	});
 
