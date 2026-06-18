@@ -1,251 +1,442 @@
 ---
 name: branch-code-review
-description: Comprehensive code review of all changes on the current branch versus its base (develop/main). Auto-detects large diffs and spawns a parallel team of specialist reviewers (frontend, backend, SQL/DB, security, tests, cross-domain consistency). Use whenever the user asks to review the current branch, review changes before pushing, audit a feature branch, run a pre-merge check, or compare HEAD against develop/main. Make sure to use this skill any time a branch-wide review is requested, even if the user only says "review my changes" or "review this PR".
-allowed-tools: Bash(git:read-only), Bash(mkdir:*), Bash(cat:*), Bash(grep:*), Bash(test:*), Read, Write, Glob, Grep, TaskCreate, TeamCreate, TaskList, TaskUpdate, TaskGet, TaskOutput, TaskStop, SendMessage, TeamDelete, ToolSearch
+description: Human-readable branch merge-readiness review. Reviews the current branch against develop/main, auto-loads any existing .agents/reviews review for the branch, refreshes outstanding/new/resolved issue context, assigns a merge-readiness score, and saves a checklist-style markdown report for issue-by-issue follow-up validation. Use whenever the user asks to review the current branch, review changes before merging, audit a feature branch, run a pre-merge check, review this PR, or check whether a branch is safe to merge.
+allowed-tools: Bash(git:read-only), Bash(mkdir:*), Bash(test:*), Read, Write, Glob, Grep
 model: sonnet
 effort: high
 ---
 
-**Scope:** Tuned for the CXM monorepo path layout; adjust the area classifications if used elsewhere.
+Perform a careful, human-readable merge-readiness review of all changes in the current branch compared to its base branch.
 
-Perform a comprehensive code review of all changes in the current branch compared to its base branch.
+The goal is not to produce terse PR comments. The goal is to create a clear markdown review document that the user can work through issue by issue with the assistant later.
 
-**CRITICAL: READ-ONLY COMMANDS ONLY**
-You may ONLY run these git commands:
-- `git branch` (list/show branches)
-- `git log` (view history)
-- `git diff` (view changes)
-- `git status` (view status)
-- `git show` (view objects)
-- `git merge-base` (find common ancestor)
-- `git rev-parse` (parse refs)
-- `git remote -v` (list remotes)
+---
 
-NEVER run: `git checkout`, `git reset`, `git commit`, `git push`, `git pull`, `git merge`, `git rebase`, `git add`, `git rm`, `git clean`, `git stash`, or ANY command that modifies the repository.
+## Core outcome
+
+Create or refresh one review document at:
+
+```text
+<repo-root>/.agents/reviews/<branch-name-with-slashes-replaced-by-dashes>.md
+```
+
+Example:
+
+```text
+.agents/reviews/feat-fcanete-MS_Teams_realtime_users.md
+```
+
+The report must answer:
+
+1. Is this branch ready to merge?
+2. What is the merge-readiness score?
+3. What are the highest-risk issues?
+4. Which issues are new, still present, resolved-looking, ignored, or need validation?
+5. What order should the user validate/fix issues in?
+
+---
+
+## Safety rules
+
+**Read-only repository commands only.**
+
+You may run:
+
+- `git branch`
+- `git log`
+- `git diff`
+- `git status`
+- `git show`
+- `git merge-base`
+- `git rev-parse`
+- `git remote -v`
+- `git check-ignore`
+
+You may also create the local review directory and write the review markdown file.
+
+Never run commands that mutate repository state, including:
+
+- `git checkout`
+- `git reset`
+- `git commit`
+- `git push`
+- `git pull`
+- `git merge`
+- `git rebase`
+- `git add`
+- `git rm`
+- `git clean`
+- `git stash`
 
 ---
 
 ## Inputs
 
-The user may invoke this skill with optional context:
+The user may provide optional context:
 
-- **Prior review path** — if the user says something like *"compare with the existing review"*, *"here's the previous review at <path>"*, or passes `--prior <path>`, read that file before starting. Use it for the New-vs-existing diff in Phase 5 and to honor `<!-- ignore: ... -->` annotations the user may have left in it.
-- **Save override** — if the user says `--no-save` or *"don't save the file"*, skip Phase 6's file write at the end. Otherwise auto-save is the default.
+- `--no-save` or “do not save” — produce the report in the response only and skip writing the file.
+- A specific base branch or fixed point — use it if explicitly provided.
+- A specific prior review path — read it if provided, but normally auto-detect the branch review file.
+- A spec, PRD, issue link, or spec path — use it for optional spec-alignment review.
 
-If the user did not pass a prior review path explicitly, do **not** auto-discover one. Run a fresh review.
+Default behavior is to auto-load the existing review file for the current branch if it exists.
 
 ---
 
-## Phase 1: Gather Context
+## Phase 1: Detect branch, base, review path, and spec context
 
-1. **Detect base branch and current branch:**
+1. Detect repo root:
+
+   ```bash
+   git rev-parse --show-toplevel
+   ```
+
+2. Detect current branch:
+
    ```bash
    git branch --show-current
    ```
 
+3. Detect base branch, unless user gave one explicitly:
+
    ```bash
-   # Detect base branch (develop if exists, otherwise main)
-   git rev-parse --verify develop >/dev/null 2>&1 && echo "develop" || echo "main"
+   git rev-parse --verify develop >/dev/null 2>&1 && echo develop || echo main
    ```
 
-2. **Get commit history and diff stats:**
+4. Validate the chosen base or fixed point resolves before continuing:
+
    ```bash
-   git log <base>..HEAD --oneline --no-decorate
-   git diff <base>...HEAD --stat
-   git diff <base>...HEAD --name-only
+   git rev-parse --verify <base>
    ```
 
-3. **Classify changed files into areas:**
-   - **Frontend**: `app/frontend/**`, `app/cxm-core/**`, `*.tsx`, `*.jsx`, `*.css`, `*.scss`
-   - **Backend**: `app/api/**`, `app/mono/**`, `app/voice/**`, `app/websocket-server/**`, `app/cron/**`, `app/flow/**`, `app/ingest/**`, `app/salesforce-cdc/**`
-   - **SQL/DB**: `infrastructure/sql/**`, `**/migrations/**`, `**/seeders/**`, `*.sql`, Sequelize model files (`**/models/**`)
-   - **Tests**: `**/*.test.*`, `**/*.spec.*`, `**/tests/**`, `app/e2e-testing-suite/**`, `app/tests/**`
-   - **Security-sensitive**: Files touching auth, tokens, secrets, integrations, permissions, middleware
+   If it does not resolve, stop and ask the user to clarify the comparison point.
 
-**Empty-diff edge case:** If `git log <base>..HEAD` is empty, report "No changes to review on this branch" and stop.
+5. Compute review path:
+
+   - Replace every `/` in the branch name with `-`.
+   - Use a flat file directly inside `.agents/reviews/`.
+
+   ```text
+   <repo-root>/.agents/reviews/<safe-branch-name>.md
+   ```
+
+6. If the review file already exists, read it before starting the new review.
+
+   Treat it as prior context, not as truth. The current code and diff always win.
+
+7. Determine whether a spec source exists:
+
+   - First use any spec, PRD, issue link, or path explicitly provided by the user.
+   - Otherwise look for likely matching files under `docs/`, `specs/`, or `.scratch/`.
+   - If nothing useful is found, proceed without spec review.
+
+   Spec alignment is optional. Do not block the review if no spec is available.
 
 ---
 
-## Phase 2: Decide Review Mode
+## Phase 2: Gather review context
 
-Count how many areas have changed files. Use **team mode** if **3 or more areas** have changes. Otherwise use **solo mode**.
+Run:
 
-### Solo Mode (< 3 areas changed)
-
-Run the review yourself following the standard analysis below (Phase 3-Solo).
-
-### Team Mode (3+ areas changed)
-
-Spawn a team of specialist review agents in parallel. Each agent reviews ONLY the files in their domain. Proceed to Phase 3-Team.
-
----
-
-## Phase 3-Solo: Standard Single-Agent Review
-
-Get the full diff:
 ```bash
+git status --short
+git log <base>..HEAD --oneline --no-decorate
+git diff <base>...HEAD --stat
+git diff <base>...HEAD --name-only
 git diff <base>...HEAD
 ```
 
-Analyze the changes from ALL these perspectives, but DO NOT output findings per-phase. Instead, collect all findings for the consolidated output:
+Capture these explicitly for the report header:
 
-**Perspectives to analyze:**
-- Logic & Correctness (bugs, edge cases, null handling, race conditions)
-- Security (injection, validation, secrets, auth)
-- Performance (memory leaks, unnecessary work, N+1 patterns)
-- Code Quality (complexity, naming, types)
-- Project Conventions (check CLAUDE.md for project-specific rules, **and apply the User Review Rules block defined in [references/team-mode.md](references/team-mode.md)**)
-- Simplification (can code be significantly simpler?)
-- DRY (does similar code already exist in codebase?)
-- Breaking Changes (will this break other code?)
-- Test Coverage (are new/modified code paths covered by tests?)
+- Comparison base: `<base>`
+- Reviewed range: `<base>...HEAD`
+- Commits reviewed: short commit list from `git log <base>..HEAD --oneline --no-decorate`
 
-Search for DRY violations, breaking change impacts, and test coverage gaps. Produce findings in the **PR-comment block format** described in Phase 5 (file-anchor header + ` ```diff ` hunk + severity-prefixed comment + optional ` ```suggestion ` block). Then **skip Phase 4 (validation runs in team mode only)** and go straight to Phase 5. Solo findings appear in the report unmarked (no `✓ validated` markers, no `Filtered out by validation pass` block, no `Specialist verdicts` block).
+If `git log <base>..HEAD` is empty and the diff is empty, report:
 
----
-
-## Phase 3-Team: Spawn Specialist Agents
-
-First call `ToolSearch` with `query: 'select:TaskCreate,TeamCreate,TaskList,TaskUpdate,SendMessage'` to load the spawn primitives, then use `TaskCreate` (not `Task`) to spawn each specialist with `subagent_type: 'general-purpose'`, `model: 'sonnet'`, `effort: 'high'`.
-
-Each agent gets:
-- The list of changed files in their domain
-- The branch name and base branch
-- Instructions to produce findings in the standard format
-- **The User Review Rules block, appended verbatim to their prompt**
-- **The Comment Block Format block, appended verbatim to their prompt** (so subagents emit findings in the exact shape the orchestrator expects)
-
-**IMPORTANT**: Only spawn agents for areas that actually have changes. Skip areas with no changed files. The Security and Cross-Domain Consistency reviewers always run in team mode regardless of area count.
-
-If team mode triggered, see [references/team-mode.md](references/team-mode.md) for the full specialist agent prompts, the User Review Rules block, and the Comment Block Format block to append to each.
-
----
-
-## Phase 4: Validate Findings (team mode only)
-
-**Solo mode skips this phase entirely** — its findings go straight to Phase 5 unmarked.
-
-After all specialists complete, first consolidate, then validate.
-
-**4a. Consolidate**:
-1. **Collect** all agent outputs
-2. **Deduplicate** — if multiple agents flagged the same code (e.g., backend + security both flag an injection), merge into one finding with combined tags. Keep the highest severity of the merged set.
-3. **Group by severity** — `blocking` > `should-fix` > `nit` > `question`. The final report renders these as separate sections; do not interleave.
-4. **Determine overall verdict** — ❌ if any `blocking` finding survives, ⚠️ if only `should-fix` / `nit`, ✅ if no findings at all.
-5. **Clean up the specialist team** — send shutdown requests and delete the team
-
-**4b. Validate**: run a single validator subagent that re-checks every aggregated finding against the actual code. This catches false-positives from individual specialists who may have misread context.
-
-1. **Aggregate** all consolidated findings into a single flat list. Each entry must carry: file path, line number, claim, severity, tags, and source-specialist.
-2. **Spawn one validator subagent** via `TaskCreate` with `subagent_type: 'general-purpose'`, `model: sonnet`, `effort: high` (the validator is the single quality gate — see [references/team-mode.md#validator](references/team-mode.md#validator) for the rationale). Pass it:
-   - The full aggregated findings list (verbatim claims, not paraphrased)
-   - The validator prompt and rules from [references/team-mode.md#validator](references/team-mode.md#validator)
-3. **Receive** a verdict per finding: `confirmed`, `partial`, or `false-positive`, each with a one-line evidence string.
-4. **Apply verdicts** when assembling the Phase 5 report:
-   - `confirmed` → keep the finding as a comment block in its severity section, and add the marker `✓ validated` on the header line right before the inline tags (e.g. `#### \`file.ts\` line 42 ✓ validated \`security\``).
-   - `partial` → keep the finding but demote its severity by one step (`blocking` → `should-fix`, `should-fix` → `nit`). Append the validator's verbatim caveat as a final italicized line inside the comment body: `_Validator caveat: …_`.
-   - `false-positive` → remove from the main report entirely. Collect all dropped findings in the `Filtered out by validation pass` `<details>` block at the bottom, each with the validator's evidence string verbatim, so the user can spot-check the validator's calls.
-5. The validator must not introduce new findings or comment on style. If it tries to, ignore those lines.
-
----
-
-## Phase 5: Output
-
-Fill in the template at [assets/review-report-template.md](assets/review-report-template.md). The output mimics a GitHub/GitLab PR review: a header verdict, then a flat stream of comment blocks grouped by **severity** (blockers → should-fix → nits → questions), not by file or category.
-
-### If a prior review was supplied (Inputs)
-
-Read the prior review file. Then, when assembling the new report:
-
-1. **Honor ignore annotations.** Any finding in the prior file that has an HTML comment of the form `<!-- ignore: <reason> -->` directly under its severity-prefix line is suppressed: if the new review would surface a semantically-equivalent finding (same file, same kind of concern, regardless of small line drift or rewording), drop it silently. Do NOT include it in the new report. At the top of the new report, in the metadata block, include `**Suppressed by prior <!-- ignore --> annotations:** N` so the user knows how many were dropped.
-2. **Mark genuinely new findings.** Add the marker `🆕` on the header line right before the inline tags (mirroring `✓ validated`'s placement) for any finding in the new review that does NOT have a semantic match in the prior review. Findings that *do* match an existing prior finding appear unmarked — do not add a "still present" or "✅ resolved" marker. Only `🆕` matters.
-3. **Match semantically, not by string equality.** Two findings match if they're about the same file and the same underlying concern (small line shifts, rewordings, refactored code that still has the same problem all count as the same finding). Use judgment; don't write a fuzzy-match algorithm.
-
-### Anatomy of a comment block
-
-````markdown
-#### `path/to/file.ts:40-44` [✓ validated] `tag1` `tag2`
-
-```diff
-@@ -40,5 +40,5 @@ functionName
- context line
--removed line
-+added line
- context line
+```text
+No branch changes found to review.
 ```
 
-**severity — short title**
-
-One or two sentences explaining the concern, citing concrete code or sibling files where useful.
-
-```diff
-+fixed code goes here
-+(every line prefixed with + so it renders green)
-```
-````
-
-- **Header — file anchor:** ` `path/to/file.ts:LINE` ` for a single line, ` `path/to/file.ts:START-END` ` for ranges. The line number must be attached directly to the path (with `:`) so terminals/editors hyperlink it. Do NOT write `lines N–M` after the path — that loses the click-through. Optional `✓ validated` (team mode, `confirmed` only), then space-separated inline-backtick tags.
-- **Context diff hunk:** ` ```diff `-tagged. Include the `@@ -L,N +L,N @@ optional-context @@`-style hunk header so line numbers are visible in the gutter. Show only the few lines needed for context. Use `-`/`+`/space prefixes per the actual diff.
-- **Severity prefix:** bold, lowercase: `**blocking — title**`, `**should-fix — title**`, `**nit — title**`, `**question — title**`, `**praise — title**`. The em dash here is a fixed structural marker — leave it as-is.
-- **Suggested-fix block:** ` ```diff `-tagged with **every line prefixed `+`** so the proposal renders green and is unambiguously marked as new code, not existing code. Do NOT use ` ```suggestion ` — it doesn't render with color outside GitHub. Optional — omit when the fix is non-trivial, when the comment is a `question`, or when rendered as a one-line nit.
-
-### Output rules
-
-1. **One concern per block.** Two issues in the same function = two blocks.
-2. **Group by severity, not by file or category.** A reader's first question is "what must I fix to merge", not "what's wrong with file X".
-3. **Tags as inline backticks**, not sections. A DRY violation is a comment tagged `dry`, not its own section.
-4. **Skip empty severity sections** entirely (no `## 💡 Nits` heading if there are no nits).
-5. **Cap nits at ~10.** Beyond that, state the count and stop.
-6. **Nits are one-liners.** No diff hunk, no suggestion block: `` - `file.ts:10` — **nit:** alias `mu` violates SQL convention. ``
-7. **Every finding must be actionable.** No vague "consider reviewing this".
-8. **`✓ validated` markers and the `Filtered out by validation pass` / `Specialist verdicts` `<details>` blocks are team-mode only.** Solo mode omits all three.
-9. **Max ~3 non-nit blocks per file.** If a file has more, the most-impactful 3 graduate; the rest become nits.
-
-### Tag reference
-
-Inline backticks on the header line, lowercase, combine multiple when relevant.
-
-- `logic` — bugs, edge cases, incorrect behavior
-- `security` — vulnerabilities, validation, secrets, auth
-- `perf` — inefficiency, N+1, memory leaks
-- `quality` — complexity, naming, types
-- `convention` — project style violations (User Review Rules, CLAUDE.md, memory)
-- `simplify` — can be significantly simpler
-- `dry` — duplicates existing code
-- `breaking` — may break other code or external contracts
-- `tests` — missing or weak test coverage
-- `consistency` — cross-domain mismatch (API/consumer, model/migration, event/listener)
+Still save a short review file unless `--no-save` was requested.
 
 ---
 
-## Phase 6: Save the report
+## Phase 3: Analyze changes
 
-Unless the user passed `--no-save` or asked you not to save, persist the rendered report to disk.
+Review the branch from these angles:
 
-**Path:** `<repo-root>/.claude/reviews/<branch-name-with-slashes-replaced-by-dashes>.md` — a flat file inside `.claude/reviews/`, no subdirectories. Replace every `/` in the branch name with `-`. Example: branch `feat/fcanete/MS_Teams_realtime_users` → `.claude/reviews/feat-fcanete-MS_Teams_realtime_users.md`. The file replaces any prior version at the same path (one file per branch — overwrite, do not accumulate timestamped copies).
+- Correctness: bugs, edge cases, null handling, races, state mismatches
+- Security: auth, permissions, secrets, tokens, injection, validation
+- Data/database: migrations, models, schema changes, backward compatibility
+- API/contracts: request/response shape, events, jobs, queues, integrations
+- Frontend/user impact: rendering, loading/error states, accessibility, UX regressions
+- Performance: N+1 patterns, expensive loops, memory leaks, unnecessary network calls
+- Tests: missing coverage for changed behavior, weak assertions, untested edge cases
+- Maintainability: unnecessary complexity, naming, duplication, type quality
+- Project conventions: match existing patterns in the repo; do not invent new conventions
+- Spec alignment: if a spec exists, check for missing requirements, partial implementation, incorrect implementation, or scope creep
+- Merge risk: anything that could break production, CI, deploys, or downstream consumers
 
-**Steps:**
+Before claiming a pattern violation, search for nearby or similar in-repo examples and cite them if useful.
 
-1. Compute the path. Use `git rev-parse --show-toplevel` to find the repo root. Replace all `/` in the branch name with `-` to form the filename.
-2. Ensure the reviews directory exists: `mkdir -p <repo-root>/.claude/reviews` (flat — no subdirectories).
-3. Write the rendered report with `Write`. Replaces any prior file.
-4. **Gitignore reminder (one-shot per session):** check whether `.claude/reviews/` is ignored. Run:
+If a spec exists, summarize:
+
+- whether the branch appears aligned overall
+- any missing or partial requirements
+- any behavior added that the spec did not ask for
+- any implementation that appears inconsistent with the intended behavior
+
+Prefer fewer, higher-quality findings over a long list of weak speculation.
+
+---
+
+## Phase 4: Reconcile with existing review, if present
+
+If an existing review file was found, compare its issues with the current branch state.
+
+For each previous issue:
+
+- **Still present** — the same underlying concern still exists.
+- **Resolved?** — the relevant code appears changed or removed, but user confirmation may be useful.
+- **Ignored** — preserve if the old issue was marked ignored or has clear validation notes saying it should be ignored.
+- **Needs validation** — the previous issue cannot be confidently confirmed or dismissed from the current diff alone.
+
+Rules:
+
+1. Do not duplicate an existing issue as a separate new issue if it is the same underlying concern.
+2. Mark repeated issues as `Still present`.
+3. Mark genuinely new findings as `New`.
+4. Preserve useful old validation notes when they still apply.
+5. If a prior issue appears fixed, include it in the “Previous review context” table as `Resolved?`, not in the main active issue list unless there is still a concrete problem.
+6. The current code and diff override the previous review. If the previous review was wrong, say so briefly.
+
+---
+
+## Phase 5: Score merge readiness
+
+Assign a merge-readiness score from 0–100%.
+
+This is not a generic code-quality score. It estimates confidence that the branch can be merged safely.
+
+Suggested interpretation:
+
+- `95–100%` — ready or nearly ready; only trivial issues
+- `85–94%` — likely mergeable after minor checks or fixes
+- `70–84%` — meaningful issues should be addressed first
+- `50–69%` — risky; not recommended to merge yet
+- `<50%` — high risk or incomplete
+
+Use severity to guide scoring:
+
+- Any confirmed blocker normally caps score at `69%`.
+- Multiple blockers normally cap score at `50%`.
+- Missing important tests normally caps score around `85%`, lower if behavior is risky.
+- Only nits/questions normally keep score `90%+`.
+
+Also include a score breakdown table:
+
+- Correctness
+- Security
+- Tests
+- Maintainability
+- Merge/deploy risk
+
+---
+
+## Phase 6: Report format
+
+Render the report in this human-readable markdown format.
+
+```markdown
+# Branch Review: <branch-name>
+
+**Base:** <base>  
+**Branch:** <branch>  
+**Reviewed range:** `<base>...HEAD`  
+**Review file:** `.agents/reviews/<safe-branch>.md`  
+**Existing review loaded:** Yes/No  
+**Spec source:** None / `<path-or-issue>`  
+**Merge readiness:** <N>%  
+**Verdict:** Ready / Probably ready / Not ready / High risk
+
+## Commits reviewed
+
+- `<sha> message`
+- `<sha> message`
+
+## Summary
+
+Short plain-English summary of what changed and the main merge risk.
+
+## Score breakdown
+
+| Area | Score | Notes |
+|---|---:|---|
+| Correctness | 90% | ... |
+| Security | 95% | ... |
+| Tests | 75% | ... |
+| Maintainability | 85% | ... |
+| Merge/deploy risk | 80% | ... |
+
+## Spec alignment
+
+Include this section only if a spec source exists.
+
+- **Overall alignment:** Aligned / Mostly aligned / Unclear / Misaligned
+- **Source:** `<path-or-issue>`
+- **Notes:** Short plain-English summary of gaps, scope creep, or unclear behavior.
+
+## Previous review context
+
+Include this section only if an existing review was loaded.
+
+| Previous issue | Current status | Notes |
+|---|---|---|
+| #1 Short title | Still present | Same underlying issue remains in `path/file.ts`. |
+| #2 Short title | Resolved? | Code changed; user should confirm behavior. |
+
+## Recommended validation order
+
+1. [ ] BLOCKER — Still present — `path/file.ts:42` — Short title
+2. [ ] SHOULD-FIX — New — `path/file.ts:88` — Short title
+3. [ ] TESTS — New — `path/file.test.ts` — Missing coverage for X
+
+## Active issues
+
+### 1. BLOCKER — Short title
+
+**Status:** New / Still present / Needs validation  
+**File:** `path/file.ts:42-55`  
+**Category:** Correctness / Security / Tests / Maintainability / Performance / Data / API / Frontend / Merge risk  
+**Axis:** Merge risk / Standards / Spec / Tests / Security  
+**Confidence:** High / Medium / Low  
+**Impact:** One sentence about what can go wrong.
+
+#### What I found
+
+Plain-English explanation.
+
+#### Relevant code
+
+```diff
+@@ -42,5 +42,5 @@ functionName
+ small focused snippet
+```
+
+#### Why it matters
+
+Explain the consequence in practical terms.
+
+#### Suggested fix
+
+Optional. Include only if the fix is reasonably clear. Keep it concise.
+
+#### Validation notes
+
+- Pending user validation.
+
+### 2. SHOULD-FIX — Short title
+
+...
+
+## Non-blocking notes
+
+Short bullets for minor nits/questions. Keep this section brief.
+
+## Final recommendation
+
+One paragraph saying what should happen before merge.
+```
+
+Format rules:
+
+1. Write for a human reader, not for GitHub inline comments.
+2. Use numbered issues so the user can say “let’s check issue 3”.
+3. Keep each issue self-contained.
+4. Use small code snippets only. Avoid giant diff hunks.
+5. Every active issue must be actionable or explicitly marked as a question.
+6. Include an `Axis` field for each active issue so the user can see whether it is primarily merge-risk, standards, spec, tests, or security related.
+7. Prefer plain English over jargon.
+8. Cap non-blocking notes at roughly 10 items.
+9. Do not bury blockers under long summaries.
+10. If there are no active issues, say so clearly and make the recommended validation order empty.
+11. Do not invent issues just to fill the report.
+
+Severity labels:
+
+- `BLOCKER` — should not merge until addressed or explicitly accepted
+- `SHOULD-FIX` — should be fixed before merge, but not necessarily catastrophic
+- `TESTS` — missing or weak test coverage for meaningful behavior
+- `QUESTION` — needs clarification before deciding risk
+- `NIT` — optional cleanup only
+
+Issue status labels:
+
+- `New`
+- `Still present`
+- `Needs validation`
+- `Resolved?`
+- `Ignored`
+
+Only include `Resolved?` and `Ignored` issues in “Previous review context”, not in “Active issues”, unless there is still a concrete active risk.
+
+---
+
+## Phase 7: Save the report
+
+Unless the user passed `--no-save` or asked not to save:
+
+1. Ensure the directory exists:
+
    ```bash
-   git check-ignore -q .claude/reviews/dummy.md && echo "ignored" || echo "not-ignored"
+   mkdir -p <repo-root>/.agents/reviews
    ```
-   If the answer is `not-ignored`, append a single line at the very end of your text reply to the user (NOT inside the saved file): `> Tip: add \`/.claude/reviews/\` to your \`.gitignore\` (or \`~/.config/git/ignore\`) to keep these review notes local.` Do not nag the user on subsequent runs in the same session.
-5. **Print the saved path** in your text reply to the user, on its own line, prefixed `Saved review to: ` so it's easy to spot and click.
 
-**If the file already existed before this run** (i.e. there was a prior review at the same path) and the user did NOT pass that prior file as input via Inputs, mention it in your text reply: `> Note: a prior review existed at <path> and was overwritten. Pass it as input next time if you want a New-vs-existing diff.`
+2. Write the rendered report to the computed review path with `Write`.
+
+3. If the file existed before this run, overwrite it with the refreshed report.
+
+4. In the final user response, print one of:
+
+   ```text
+   Created review: <path>
+   ```
+
+   or
+
+   ```text
+   Updated review: <path>
+   ```
+
+5. Check whether `.agents/reviews/` is ignored:
+
+   ```bash
+   git check-ignore -q .agents/reviews/dummy.md && echo ignored || echo not-ignored
+   ```
+
+   If it is not ignored, append this tip once in the final response:
+
+   ```markdown
+   > Tip: add `/.agents/reviews/` to your `.gitignore` or global git ignore if you want review docs to stay local.
+   ```
 
 ---
 
-Begin the review now.
+## Final response to user
 
-<details><summary>Eval tasks</summary>
+Keep the final response concise:
 
-1. Small UI-only branch (1-3 files in `app/frontend/`) → should route to solo mode.
-2. Large multi-area branch (frontend + API + SQL migration) → should route to team mode and spawn frontend, backend, SQL/DB, plus consistency reviewer.
-3. Security-sensitive branch (auth/permissions changes) → should always include the security reviewer regardless of size.
+- verdict
+- merge-readiness score
+- reviewed range
+- spec source used or not used
+- active issue count by severity
+- created/updated review path
+- gitignore tip if relevant
 
-</details>
+Do not paste the full report in chat if it was saved, unless the user asks.
+
+---
+
+Begin the branch review now.
